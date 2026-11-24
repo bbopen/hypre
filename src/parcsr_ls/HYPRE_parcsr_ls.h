@@ -1916,6 +1916,9 @@ HYPRE_Int HYPRE_FSAISolve( HYPRE_Solver       solver,
  *      - 1: Adaptive (can use OpenMP with static scheduling)
  *      - 2: Adaptive OpenMP with dynamic scheduling
  *      - 3: Static - power pattern
+ *      - 4: 4-bit zero-index BitFSAI (real arithmetic only; uses 8 B/row FP64
+ *           intermediate on double-precision builds, 4 B/row FP32 on single
+ *           with automatic wide promotion on extreme scales)
  **/
 HYPRE_Int HYPRE_FSAISetAlgoType( HYPRE_Solver solver,
                                  HYPRE_Int    algo_type );

@@ -632,6 +632,7 @@ hypre_FSAIComputeOmega
 hypre_FSAICreate
 hypre_FSAIDestroy
 hypre_FSAIDumpLocalLSDense
+hypre_FSAIFreeBitFSAI
 hypre_FSAIGetAlgoType
 hypre_FSAIGetEigMaxIters
 hypre_FSAIGetKapTolerance

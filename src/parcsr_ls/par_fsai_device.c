@@ -8,6 +8,7 @@
 #include "_hypre_parcsr_ls.h"
 #include "_hypre_utilities.hpp"
 #include "par_fsai.h"
+#include <float.h>
 
 #if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
 
@@ -1269,8 +1270,865 @@ hypre_FSAISetupStaticPowerDevice( void               *fsai_vdata,
    return hypre_error_flag;
 }
 
+#if !defined(HYPRE_COMPLEX)
+
+/*--------------------------------------------------------------------------
+ * BitFSAI (algo_type == 4) device kernels (CUDA / HIP)
+ *--------------------------------------------------------------------------*/
+
+constexpr HYPRE_Int HYPRE_BITFSAI_ERR_INVALID_DIAG = 1;
+constexpr HYPRE_Int HYPRE_BITFSAI_ERR_UNREP        = 2;
+constexpr HYPRE_Int HYPRE_BITFSAI_FLAG_WIDE_APPLY  = 4;
+constexpr HYPRE_Int HYPRE_BITFSAI_ERR_NONSYMMETRIC = 8;
+
+__device__ __forceinline__ bool
+hypre_BitFSAIIsFiniteDevice( double v )
+{
+   return (v == v && v >= -DBL_MAX && v <= DBL_MAX);
+}
+
+__device__ __forceinline__ bool
+hypre_BitFSAIIsStorableF32Device( double v )
+{
+   float s = (float) v;
+   return (hypre_BitFSAIIsFiniteDevice(v) && s == s && s != 0.0f && s >= -FLT_MAX && s <= FLT_MAX);
+}
+
+__device__ __forceinline__ HYPRE_Int
+hypre_BitFSAIProjectRowDevice( HYPRE_Int     m,
+                               const double *q_dec,
+                               const double *L,
+                               const double *A_patch,
+                               double       *diag_out,
+                               double       *scale_out )
+{
+   constexpr HYPRE_Int MAX_PATCH = 16;
+   if (m < 2)
+   {
+      return 0;
+   }
+   double c22 = A_patch[(m - 1) * MAX_PATCH + (m - 1)];
+   if (!(c22 > 0.0) || !hypre_BitFSAIIsFiniteDevice(c22))
+   {
+      return -1;
+   }
+
+   double c11 = 0.0;
+   double c12 = 0.0;
+   for (HYPRE_Int b = 0; b < m - 1; b++)
+   {
+      double ub = 0.0;
+      for (HYPRE_Int a = b; a < m - 1; a++)
+      {
+         ub += L[a * MAX_PATCH + b] * q_dec[a];
+      }
+      c11 += ub * ub;
+      c12 += ub * L[(m - 1) * MAX_PATCH + b];
+   }
+   if (!(c11 > 0.0) || !hypre_BitFSAIIsFiniteDevice(c11) || !hypre_BitFSAIIsFiniteDevice(c12))
+   {
+      return 0;
+   }
+
+   double projection = c12 / c11;
+   if (!hypre_BitFSAIIsFiniteDevice(projection))
+   {
+      return 0;
+   }
+
+   double residual_sq = 0.0;
+   for (HYPRE_Int b = 0; b < m; b++)
+   {
+      double ub = 0.0;
+      if (b < m - 1)
+      {
+         for (HYPRE_Int a = b; a < m - 1; a++)
+         {
+            ub += L[a * MAX_PATCH + b] * q_dec[a];
+         }
+      }
+      double res = L[(m - 1) * MAX_PATCH + b] - projection * ub;
+      residual_sq += res * res;
+   }
+   if (!(residual_sq > 0.0) || !hypre_BitFSAIIsFiniteDevice(residual_sq))
+   {
+      return 0;
+   }
+
+   double g_opt = 1.0 / sqrt(residual_sq);
+   double s_opt = -projection * g_opt;
+   if (!(g_opt > 0.0) || !hypre_BitFSAIIsFiniteDevice(g_opt) || !hypre_BitFSAIIsFiniteDevice(s_opt))
+   {
+      return 0;
+   }
+
+   float g_f32 = (float) g_opt;
+   float s_f32 = (float) s_opt;
+   if (s_f32 == 0.0f)
+   {
+      return 0;
+   }
+   if (!hypre_BitFSAIIsStorableF32Device(g_opt) || !hypre_BitFSAIIsStorableF32Device(s_opt))
+   {
+      return -2;
+   }
+
+   double sg = (double) g_f32;
+   double ss = (double) s_f32;
+   double energy = 0.0;
+   double comp = 0.0;
+   double sum_abs = 0.0;
+   for (HYPRE_Int a = 0; a < m; a++)
+   {
+      double wa = (a == m - 1) ? sg : (ss * q_dec[a]);
+      for (HYPRE_Int b = 0; b < m; b++)
+      {
+         double wb = (b == m - 1) ? sg : (ss * q_dec[b]);
+         double a_ab = (a >= b) ? A_patch[a * MAX_PATCH + b] : A_patch[b * MAX_PATCH + a];
+         double term = wa * a_ab * wb;
+         if (!hypre_BitFSAIIsFiniteDevice(term))
+         {
+            return -2;
+         }
+         double adj = term - comp;
+         double next = energy + adj;
+         comp = (next - energy) - adj;
+         energy = next;
+         sum_abs += fabs(term);
+      }
+   }
+   if (!hypre_BitFSAIIsFiniteDevice(energy) || !hypre_BitFSAIIsFiniteDevice(sum_abs))
+   {
+      return -2;
+   }
+   double bound = 8.0 * DBL_EPSILON * sum_abs;
+   if (!(fabs(energy - 1.0) + bound <= 1.0e-4))
+   {
+      return 0;
+   }
+
+   *diag_out  = g_opt;
+   *scale_out = s_opt;
+   return 1;
+}
+
+__device__ __forceinline__ HYPRE_Int
+hypre_BitFSAIFindPosDevice( const HYPRE_Int *A_i,
+                            const HYPRE_Int *A_j,
+                            HYPRE_Int        row,
+                            HYPRE_Int        target_col )
+{
+   HYPRE_Int rs = read_only_load(A_i + row);
+   HYPRE_Int re = read_only_load(A_i + row + 1);
+   for (HYPRE_Int k = rs; k < re; k++)
+   {
+      if (read_only_load(A_j + k) == target_col)
+      {
+         return k;
+      }
+   }
+   return -1;
+}
+
+__global__ void
+hypre_GPUKernelBitFSAISetup( hypre_DeviceItem    &item,
+                             HYPRE_Int            num_rows,
+                             HYPRE_Int            patch_cap,
+                             const HYPRE_Int     *A_i,
+                             const HYPRE_Int     *A_j,
+                             const HYPRE_Complex *A_a,
+                             float               *g_diag,
+                             float               *g_scale,
+                             unsigned char       *q_tmp,
+                             HYPRE_Int           *err_flags )
+{
+   constexpr HYPRE_Int MAX_PATCH = 16;
+
+   for (HYPRE_Int i = hypre_gpu_get_grid_thread_id<1, 1>(item);
+        i < num_rows;
+        i += hypre_gpu_get_grid_num_threads<1, 1>(item))
+   {
+      HYPRE_Int     J[MAX_PATCH];
+      HYPRE_Int     Klow[MAX_PATCH];
+      HYPRE_Int     Kup[MAX_PATCH];
+      double        a_off[MAX_PATCH];
+      double        A_patch[MAX_PATCH * MAX_PATCH];
+      double        L[MAX_PATCH * MAX_PATCH];
+      double        g_off[MAX_PATCH];
+      double        q_dec[MAX_PATCH];
+      unsigned char q_code[MAX_PATCH];
+
+      HYPRE_Int rs    = read_only_load(A_i + i);
+      HYPRE_Int re    = read_only_load(A_i + i + 1);
+      HYPRE_Int m_off = 0;
+      double    a_ii  = 0.0;
+      bool      found_diag = false;
+      bool      diagonal_only = false;
+      double    g_d   = 0.0;
+      double    scale = 0.0;
+
+      for (HYPRE_Int k = rs; k < re; k++)
+      {
+         HYPRE_Int col = read_only_load(A_j + k);
+         double    val = (double) read_only_load(A_a + k);
+         if (col == i)
+         {
+            a_ii = val;
+            found_diag = true;
+         }
+         else if (col < i)
+         {
+            HYPRE_Int k_up = hypre_BitFSAIFindPosDevice(A_i, A_j, col, i);
+            if (k_up < 0)
+            {
+               atomicOr(err_flags, HYPRE_BITFSAI_ERR_NONSYMMETRIC);
+               continue;
+            }
+            if (m_off < patch_cap - 1)
+            {
+               J[m_off]     = col;
+               Klow[m_off]  = k;
+               Kup[m_off]   = k_up;
+               a_off[m_off] = val;
+               m_off++;
+            }
+            else if (patch_cap > 1)
+            {
+               HYPRE_Int min_idx = 0;
+               double    min_abs = fabs(a_off[0]);
+               for (HYPRE_Int a = 1; a < m_off; a++)
+               {
+                  double av = fabs(a_off[a]);
+                  if (av < min_abs)
+                  {
+                     min_abs = av;
+                     min_idx = a;
+                  }
+               }
+               if (fabs(val) > min_abs)
+               {
+                  J[min_idx]     = col;
+                  Klow[min_idx]  = k;
+                  Kup[min_idx]   = k_up;
+                  a_off[min_idx] = val;
+               }
+            }
+         }
+         else
+         {
+            if (hypre_BitFSAIFindPosDevice(A_i, A_j, col, i) < 0)
+            {
+               atomicOr(err_flags, HYPRE_BITFSAI_ERR_NONSYMMETRIC);
+            }
+         }
+      }
+
+      if (!found_diag || !(a_ii > 0.0) || !hypre_BitFSAIIsFiniteDevice(a_ii))
+      {
+         atomicOr(err_flags, HYPRE_BITFSAI_ERR_INVALID_DIAG);
+         g_diag[i]  = 1.0f;
+         g_scale[i] = 1.0f;
+         continue;
+      }
+
+      if (m_off == 0)
+      {
+         diagonal_only = true;
+         g_d   = 1.0 / sqrt(a_ii);
+         scale = g_d;
+      }
+      else
+      {
+         HYPRE_Int m = m_off + 1;
+         for (HYPRE_Int a = 0; a < m; a++)
+         {
+            for (HYPRE_Int b = 0; b <= a; b++)
+            {
+               A_patch[a * MAX_PATCH + b] = 0.0;
+            }
+         }
+
+         for (HYPRE_Int a = 0; a < m_off; a++)
+         {
+            HYPRE_Int ra  = J[a];
+            HYPRE_Int rrs = read_only_load(A_i + ra);
+            HYPRE_Int rre = read_only_load(A_i + ra + 1);
+            for (HYPRE_Int k = rrs; k < rre; k++)
+            {
+               HYPRE_Int col = read_only_load(A_j + k);
+               for (HYPRE_Int b = 0; b <= a; b++)
+               {
+                  if (J[b] == col)
+                  {
+                     A_patch[a * MAX_PATCH + b] = (double) read_only_load(A_a + k);
+                     break;
+                  }
+               }
+            }
+            A_patch[(m - 1) * MAX_PATCH + a] = a_off[a];
+         }
+         A_patch[(m - 1) * MAX_PATCH + (m - 1)] = a_ii;
+
+         for (HYPRE_Int a = 0; a < m; a++)
+         {
+            for (HYPRE_Int b = 0; b <= a; b++)
+            {
+               L[a * MAX_PATCH + b] = A_patch[a * MAX_PATCH + b];
+            }
+         }
+
+         bool ok = true;
+         for (HYPRE_Int a = 0; a < m && ok; a++)
+         {
+            for (HYPRE_Int b = 0; b <= a; b++)
+            {
+               double s = L[a * MAX_PATCH + b];
+               for (HYPRE_Int c = 0; c < b; c++)
+               {
+                  s -= L[a * MAX_PATCH + c] * L[b * MAX_PATCH + c];
+               }
+               if (a == b)
+               {
+                  if (!(s > 0.0) || !hypre_BitFSAIIsFiniteDevice(s))
+                  {
+                     ok = false;
+                     break;
+                  }
+                  L[a * MAX_PATCH + a] = sqrt(s);
+               }
+               else
+               {
+                  double lv = s / L[b * MAX_PATCH + b];
+                  if (!hypre_BitFSAIIsFiniteDevice(lv))
+                  {
+                     ok = false;
+                     break;
+                  }
+                  L[a * MAX_PATCH + b] = lv;
+               }
+            }
+         }
+
+         if (ok)
+         {
+            g_d = 1.0 / L[(m - 1) * MAX_PATCH + (m - 1)];
+            if (!hypre_BitFSAIIsFiniteDevice(g_d))
+            {
+               ok = false;
+            }
+            else
+            {
+               for (HYPRE_Int a = m_off - 1; a >= 0; a--)
+               {
+                  double s = -L[(m - 1) * MAX_PATCH + a] * g_d;
+                  for (HYPRE_Int b = a + 1; b < m_off; b++)
+                  {
+                     s -= L[b * MAX_PATCH + a] * g_off[b];
+                  }
+                  g_off[a] = s / L[a * MAX_PATCH + a];
+                  if (!hypre_BitFSAIIsFiniteDevice(g_off[a]))
+                  {
+                     ok = false;
+                     break;
+                  }
+               }
+            }
+         }
+
+         if (!ok)
+         {
+            diagonal_only = true;
+            g_d   = 1.0 / sqrt(a_ii);
+            scale = g_d;
+         }
+         else
+         {
+            scale = 0.0;
+            for (HYPRE_Int a = 0; a < m_off; a++)
+            {
+               scale = fmax(scale, fabs(g_off[a]));
+            }
+
+            if (!(scale > 0.0) || !hypre_BitFSAIIsFiniteDevice(scale))
+            {
+               diagonal_only = true;
+               g_d   = 1.0 / sqrt(a_ii);
+               scale = g_d;
+            }
+            else
+            {
+               for (HYPRE_Int a = 0; a < m_off; a++)
+               {
+                  double    u = 7.0 * (g_off[a] / scale);
+                  HYPRE_Int q = (HYPRE_Int)(u >= 0.0 ? floor(u + 0.5) : ceil(u - 0.5));
+                  if (q > 7)  { q = 7; }
+                  if (q < -7) { q = -7; }
+                  q_code[a] = (unsigned char)(q + 8);
+                  q_dec[a]  = (double)(((float) q) * (1.0f / 7.0f));
+               }
+
+               HYPRE_Int proj_rc = hypre_BitFSAIProjectRowDevice(m, q_dec, L, A_patch, &g_d, &scale);
+               if (proj_rc == -1)
+               {
+                  atomicOr(err_flags, HYPRE_BITFSAI_ERR_INVALID_DIAG);
+                  g_diag[i]  = 1.0f;
+                  g_scale[i] = 1.0f;
+                  continue;
+               }
+               if (proj_rc == -2)
+               {
+                  atomicOr(err_flags, HYPRE_BITFSAI_ERR_UNREP);
+                  g_diag[i]  = 1.0f;
+                  g_scale[i] = 1.0f;
+                  continue;
+               }
+               if (proj_rc == 0)
+               {
+                  diagonal_only = true;
+                  g_d   = 1.0 / sqrt(a_ii);
+                  scale = g_d;
+                  for (HYPRE_Int a = 0; a < m_off; a++)
+                  {
+                     q_code[a] = 8;
+                  }
+               }
+               else
+               {
+                  for (HYPRE_Int a = 0; a < m_off; a++)
+                  {
+                     q_tmp[Klow[a]] = q_code[a];
+                     q_tmp[Kup[a]]  = q_code[a];
+                  }
+               }
+            }
+         }
+      }
+
+      if (!hypre_BitFSAIIsStorableF32Device(g_d) || !hypre_BitFSAIIsStorableF32Device(scale))
+      {
+         atomicOr(err_flags, HYPRE_BITFSAI_ERR_UNREP);
+         g_diag[i]  = 1.0f;
+         g_scale[i] = 1.0f;
+         continue;
+      }
+      if (diagonal_only)
+      {
+         double sd = (double)(float) g_d;
+         double se = sd * sd * a_ii;
+         if (!hypre_BitFSAIIsFiniteDevice(se) || fabs(se - 1.0) > 1.0e-4)
+         {
+            atomicOr(err_flags, HYPRE_BITFSAI_ERR_UNREP);
+            g_diag[i]  = 1.0f;
+            g_scale[i] = 1.0f;
+            continue;
+         }
+      }
+
+      double ratio = fabs(scale) / g_d;
+      if (ratio < 1e-6 || ratio > 1e6 ||
+          fabs(scale) < sqrt((double) FLT_MIN) ||
+          fabs(scale) > sqrt((double) FLT_MAX))
+      {
+         atomicOr(err_flags, HYPRE_BITFSAI_FLAG_WIDE_APPLY);
+      }
+
+      g_diag[i]  = (float) g_d;
+      g_scale[i] = (float) scale;
+   }
+}
+
+__global__ void
+hypre_GPUKernelBitFSAIPack( hypre_DeviceItem    &item,
+                            HYPRE_Int            nnz,
+                            const unsigned char *q_tmp,
+                            unsigned char       *q_packed )
+{
+   HYPRE_Int packed_bytes = (nnz / 2) + (nnz % 2);
+   for (HYPRE_Int idx = hypre_gpu_get_grid_thread_id<1, 1>(item);
+        idx < packed_bytes;
+        idx += hypre_gpu_get_grid_num_threads<1, 1>(item))
+   {
+      HYPRE_Int     k0 = idx << 1;
+      unsigned char lo = q_tmp[k0] & 0x0F;
+      unsigned char hi = (k0 + 1 < nnz) ? (q_tmp[k0 + 1] & 0x0F) : 8;
+      q_packed[idx] = (unsigned char)(lo | (hi << 4));
+   }
+}
+
+__global__ void
+hypre_GPUKernelBitFSAIFwd( hypre_DeviceItem    &item,
+                           HYPRE_Int            num_rows,
+                           const HYPRE_Int     *A_i,
+                           const HYPRE_Int     *A_j,
+                           const float         *g_diag,
+                           const float         *g_scale,
+                           const unsigned char *q_packed,
+                           const HYPRE_Complex *b_data,
+                           float               *y_work )
+{
+   for (HYPRE_Int i = hypre_gpu_get_grid_thread_id<1, 1>(item);
+        i < num_rows;
+        i += hypre_gpu_get_grid_num_threads<1, 1>(item))
+   {
+      HYPRE_Int rs  = read_only_load(A_i + i);
+      HYPRE_Int re  = read_only_load(A_i + i + 1);
+      float     sc  = g_scale[i];
+      float     acc = 0.0f;
+
+      for (HYPRE_Int k = rs; k < re; k++)
+      {
+         HYPRE_Int col = read_only_load(A_j + k);
+         if (col < i)
+         {
+            unsigned char byte = read_only_load(q_packed + (k >> 1));
+            unsigned char nib  = (k & 1) ? (byte >> 4) : (byte & 0x0F);
+            float         w    = ((float)((int) nib - 8)) * (1.0f / 7.0f);
+            acc = fmaf(w, (float) read_only_load(b_data + col), acc);
+         }
+      }
+
+      float ti  = fmaf(sc, acc, g_diag[i] * (float) b_data[i]);
+      y_work[i] = sc * ti;
+   }
+}
+
+__global__ void
+hypre_GPUKernelBitFSAITr( hypre_DeviceItem    &item,
+                          HYPRE_Int            num_rows,
+                          HYPRE_Complex        alpha,
+                          HYPRE_Real           omega,
+                          const HYPRE_Int     *A_i,
+                          const HYPRE_Int     *A_j,
+                          const float         *g_diag,
+                          const float         *g_scale,
+                          const unsigned char *q_packed,
+                          const float         *y_work,
+                          HYPRE_Complex       *x_data )
+{
+   for (HYPRE_Int j = hypre_gpu_get_grid_thread_id<1, 1>(item);
+        j < num_rows;
+        j += hypre_gpu_get_grid_num_threads<1, 1>(item))
+   {
+      HYPRE_Int rs   = read_only_load(A_i + j);
+      HYPRE_Int re   = read_only_load(A_i + j + 1);
+      float     sc_j = g_scale[j];
+      float     acc  = (sc_j != 0.0f) ? (g_diag[j] * (y_work[j] / sc_j)) : 0.0f;
+
+      for (HYPRE_Int k = rs; k < re; k++)
+      {
+         HYPRE_Int col = read_only_load(A_j + k);
+         if (col > j)
+         {
+            unsigned char byte = read_only_load(q_packed + (k >> 1));
+            unsigned char nib  = (k & 1) ? (byte >> 4) : (byte & 0x0F);
+            float         w    = ((float)((int) nib - 8)) * (1.0f / 7.0f);
+            acc = fmaf(w, read_only_load(y_work + col), acc);
+         }
+      }
+
+      if (alpha == (HYPRE_Complex) 0.0)
+      {
+         x_data[j] = (HYPRE_Complex)((double) omega * acc);
+      }
+      else
+      {
+         x_data[j] = (HYPRE_Complex)((double) alpha * (double) x_data[j] +
+                                     (double) omega * acc);
+      }
+   }
+}
+
+__global__ void
+hypre_GPUKernelBitFSAIFwdWide( hypre_DeviceItem    &item,
+                               HYPRE_Int            num_rows,
+                               const HYPRE_Int     *A_i,
+                               const HYPRE_Int     *A_j,
+                               const float         *g_diag,
+                               const float         *g_scale,
+                               const unsigned char *q_packed,
+                               const HYPRE_Complex *b_data,
+                               double              *t_work )
+{
+   for (HYPRE_Int i = hypre_gpu_get_grid_thread_id<1, 1>(item);
+        i < num_rows;
+        i += hypre_gpu_get_grid_num_threads<1, 1>(item))
+   {
+      HYPRE_Int rs  = read_only_load(A_i + i);
+      HYPRE_Int re  = read_only_load(A_i + i + 1);
+      double    sc  = (double) g_scale[i];
+      double    acc = (double) g_diag[i] * (double) b_data[i];
+
+      for (HYPRE_Int k = rs; k < re; k++)
+      {
+         HYPRE_Int col = read_only_load(A_j + k);
+         if (col < i)
+         {
+            unsigned char byte = read_only_load(q_packed + (k >> 1));
+            unsigned char nib  = (k & 1) ? (byte >> 4) : (byte & 0x0F);
+            double        w    = (double)(((float)((int) nib - 8)) * (1.0f / 7.0f));
+            acc = fma(sc * w, (double) read_only_load(b_data + col), acc);
+         }
+      }
+
+      t_work[i] = acc;
+   }
+}
+
+__global__ void
+hypre_GPUKernelBitFSAITrWide( hypre_DeviceItem    &item,
+                              HYPRE_Int            num_rows,
+                              HYPRE_Complex        alpha,
+                              HYPRE_Real           omega,
+                              const HYPRE_Int     *A_i,
+                              const HYPRE_Int     *A_j,
+                              const float         *g_diag,
+                              const float         *g_scale,
+                              const unsigned char *q_packed,
+                              const double        *t_work,
+                              HYPRE_Complex       *x_data )
+{
+   for (HYPRE_Int j = hypre_gpu_get_grid_thread_id<1, 1>(item);
+        j < num_rows;
+        j += hypre_gpu_get_grid_num_threads<1, 1>(item))
+   {
+      HYPRE_Int rs  = read_only_load(A_i + j);
+      HYPRE_Int re  = read_only_load(A_i + j + 1);
+      double    acc = (double) g_diag[j] * t_work[j];
+
+      for (HYPRE_Int k = rs; k < re; k++)
+      {
+         HYPRE_Int col = read_only_load(A_j + k);
+         if (col > j)
+         {
+            unsigned char byte = read_only_load(q_packed + (k >> 1));
+            unsigned char nib  = (k & 1) ? (byte >> 4) : (byte & 0x0F);
+            double        w    = (double)(((float)((int) nib - 8)) * (1.0f / 7.0f));
+            acc = fma((double) read_only_load(g_scale + col) * w, read_only_load(t_work + col), acc);
+         }
+      }
+
+      if (alpha == (HYPRE_Complex) 0.0)
+      {
+         x_data[j] = (HYPRE_Complex)((double) omega * acc);
+      }
+      else
+      {
+         x_data[j] = (HYPRE_Complex)((double) alpha * (double) x_data[j] +
+                                     (double) omega * acc);
+      }
+   }
+}
+
+#endif /* !defined(HYPRE_COMPLEX) */
+
 #endif /* if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP) */
 #if defined(HYPRE_USING_GPU)
+
+/*--------------------------------------------------------------------------
+ * hypre_FSAISetupBitFSAIDevice
+ *--------------------------------------------------------------------------*/
+
+HYPRE_Int
+hypre_FSAISetupBitFSAIDevice( void               *fsai_vdata,
+                              hypre_ParCSRMatrix *A )
+{
+#if (defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)) && !defined(HYPRE_COMPLEX)
+   hypre_ParFSAIData    *fsai_data   = (hypre_ParFSAIData*) fsai_vdata;
+   HYPRE_Int             max_nnz_row = hypre_ParFSAIDataMaxNnzRow(fsai_data);
+   HYPRE_MemoryLocation  memloc      = hypre_ParCSRMatrixMemoryLocation(A);
+   hypre_CSRMatrix      *A_diag      = hypre_ParCSRMatrixDiag(A);
+   HYPRE_Int             num_rows    = hypre_CSRMatrixNumRows(A_diag);
+   HYPRE_Int             nnz         = hypre_CSRMatrixNumNonzeros(A_diag);
+   HYPRE_Int             patch_cap;
+   HYPRE_Int             packed_bytes;
+   HYPRE_Int             h_err       = 0;
+   HYPRE_Int             wide_apply  = 0;
+   HYPRE_Int            *d_err_flags;
+   float                *g_diag;
+   float                *g_scale;
+   unsigned char        *q_tmp;
+   unsigned char        *q_packed;
+   float                *y_work      = NULL;
+   double               *t_work      = NULL;
+
+   hypre_FSAIFreeBitFSAI(fsai_vdata);
+
+   hypre_ParFSAIDataBitFSAIADiag(fsai_data)   = A_diag;
+   hypre_ParFSAIDataBitFSAINumRows(fsai_data) = num_rows;
+   hypre_ParFSAIDataBitFSAINnz(fsai_data)     = nnz;
+   hypre_ParFSAIDataBitFSAIMemLoc(fsai_data)  = memloc;
+
+   if (num_rows <= 0)
+   {
+      return hypre_error_flag;
+   }
+
+   if (max_nnz_row > 0)
+   {
+      patch_cap = (max_nnz_row > 16) ? 16 : max_nnz_row;
+   }
+   else
+   {
+      double avg_deg = (double) nnz / (double) num_rows;
+      patch_cap = (avg_deg > 22.0) ? 8 : 12;
+   }
+
+   packed_bytes = (nnz / 2) + (nnz % 2);
+   g_diag      = hypre_TAlloc(float, num_rows, memloc);
+   g_scale     = hypre_TAlloc(float, num_rows, memloc);
+   q_packed    = hypre_TAlloc(unsigned char, (packed_bytes > 0) ? packed_bytes : 1, memloc);
+   q_tmp       = hypre_TAlloc(unsigned char, (nnz > 0) ? nnz : 1, memloc);
+   d_err_flags = hypre_CTAlloc(HYPRE_Int, 1, memloc);
+
+   if (nnz > 0)
+   {
+      hypre_Memset(q_tmp, 8, (size_t) nnz * sizeof(unsigned char), memloc);
+   }
+
+   dim3 bDim = hypre_GetDefaultDeviceBlockDimension();
+   dim3 gDim = hypre_GetDefaultDeviceGridDimension(num_rows, "thread", bDim);
+
+   hypre_GpuProfilingPushRange("BitFSAISetup");
+   HYPRE_GPU_LAUNCH( hypre_GPUKernelBitFSAISetup, gDim, bDim,
+                     num_rows, patch_cap,
+                     hypre_CSRMatrixI(A_diag),
+                     hypre_CSRMatrixJ(A_diag),
+                     hypre_CSRMatrixData(A_diag),
+                     g_diag, g_scale, q_tmp, d_err_flags );
+
+   if (packed_bytes > 0)
+   {
+      dim3 gDimPack = hypre_GetDefaultDeviceGridDimension(packed_bytes, "thread", bDim);
+      HYPRE_GPU_LAUNCH( hypre_GPUKernelBitFSAIPack, gDimPack, bDim,
+                        nnz, q_tmp, q_packed );
+   }
+   hypre_GpuProfilingPopRange();
+
+   hypre_TMemcpy(&h_err, d_err_flags, HYPRE_Int, 1, HYPRE_MEMORY_HOST, memloc);
+   hypre_TFree(d_err_flags, memloc);
+   hypre_TFree(q_tmp, memloc);
+
+   if (h_err & (HYPRE_BITFSAI_ERR_INVALID_DIAG | HYPRE_BITFSAI_ERR_UNREP | HYPRE_BITFSAI_ERR_NONSYMMETRIC))
+   {
+      hypre_TFree(g_diag, memloc);
+      hypre_TFree(g_scale, memloc);
+      hypre_TFree(q_packed, memloc);
+      hypre_ParFSAIDataBitFSAIADiag(fsai_data)   = NULL;
+      hypre_ParFSAIDataBitFSAINumRows(fsai_data) = 0;
+      hypre_ParFSAIDataBitFSAINnz(fsai_data)     = 0;
+      if (h_err & HYPRE_BITFSAI_ERR_NONSYMMETRIC)
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) requires structurally symmetric (mirrored) A_diag\n");
+      }
+      else if (h_err & HYPRE_BITFSAI_ERR_INVALID_DIAG)
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) requires finite strictly positive diagonals\n");
+      }
+      else
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) factor cannot be represented in FP32\n");
+      }
+      return hypre_error_flag;
+   }
+
+#if !defined(HYPRE_SINGLE)
+   wide_apply = 1;
+#else
+   wide_apply = (h_err & HYPRE_BITFSAI_FLAG_WIDE_APPLY) ? 1 : 0;
+#endif
+
+   if (wide_apply)
+   {
+      t_work = hypre_TAlloc(double, num_rows, memloc);
+   }
+   else
+   {
+      y_work = hypre_TAlloc(float, num_rows, memloc);
+   }
+
+   hypre_ParFSAIDataBitFSAIWideApply(fsai_data) = wide_apply;
+   hypre_ParFSAIDataBitFSAIGDiag(fsai_data)     = g_diag;
+   hypre_ParFSAIDataBitFSAIGScale(fsai_data)    = g_scale;
+   hypre_ParFSAIDataBitFSAIQPacked(fsai_data)   = q_packed;
+   hypre_ParFSAIDataBitFSAIYWork(fsai_data)     = y_work;
+   hypre_ParFSAIDataBitFSAITWork(fsai_data)     = t_work;
+
+   return hypre_error_flag;
+#else
+   HYPRE_UNUSED_VAR(fsai_vdata);
+   HYPRE_UNUSED_VAR(A);
+   hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                     "Device BitFSAI (algo_type = 4) requires CUDA or HIP with real arithmetic!\n");
+   return hypre_error_flag;
+#endif
+}
+
+/*--------------------------------------------------------------------------
+ * hypre_FSAIApplyBitFSAIDevice
+ *--------------------------------------------------------------------------*/
+
+HYPRE_Int
+hypre_FSAIApplyBitFSAIDevice( void            *fsai_vdata,
+                              HYPRE_Complex    alpha,
+                              hypre_ParVector *b,
+                              hypre_ParVector *x )
+{
+#if (defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)) && !defined(HYPRE_COMPLEX)
+   hypre_ParFSAIData   *fsai_data  = (hypre_ParFSAIData*) fsai_vdata;
+   hypre_CSRMatrix     *A_diag     = hypre_ParFSAIDataBitFSAIADiag(fsai_data);
+   HYPRE_Int            num_rows   = hypre_ParFSAIDataBitFSAINumRows(fsai_data);
+   HYPRE_Int            wide_apply = hypre_ParFSAIDataBitFSAIWideApply(fsai_data);
+   const float         *g_diag     = hypre_ParFSAIDataBitFSAIGDiag(fsai_data);
+   const float         *g_scale    = hypre_ParFSAIDataBitFSAIGScale(fsai_data);
+   const unsigned char *q_packed   = hypre_ParFSAIDataBitFSAIQPacked(fsai_data);
+   float               *y_work     = hypre_ParFSAIDataBitFSAIYWork(fsai_data);
+   double              *t_work     = hypre_ParFSAIDataBitFSAITWork(fsai_data);
+   HYPRE_Real           omega      = hypre_ParFSAIDataOmega(fsai_data);
+
+   if (num_rows <= 0 || !A_diag)
+   {
+      return hypre_error_flag;
+   }
+
+   const HYPRE_Int     *A_i    = hypre_CSRMatrixI(A_diag);
+   const HYPRE_Int     *A_j    = hypre_CSRMatrixJ(A_diag);
+   const HYPRE_Complex *b_data = hypre_VectorData(hypre_ParVectorLocalVector(b));
+   HYPRE_Complex       *x_data = hypre_VectorData(hypre_ParVectorLocalVector(x));
+
+   dim3 bDim = hypre_GetDefaultDeviceBlockDimension();
+   dim3 gDim = hypre_GetDefaultDeviceGridDimension(num_rows, "thread", bDim);
+
+   if (wide_apply)
+   {
+      HYPRE_GPU_LAUNCH( hypre_GPUKernelBitFSAIFwdWide, gDim, bDim,
+                        num_rows, A_i, A_j, g_diag, g_scale, q_packed, b_data, t_work );
+
+      HYPRE_GPU_LAUNCH( hypre_GPUKernelBitFSAITrWide, gDim, bDim,
+                        num_rows, alpha, omega, A_i, A_j, g_diag, g_scale, q_packed, t_work, x_data );
+   }
+   else
+   {
+      HYPRE_GPU_LAUNCH( hypre_GPUKernelBitFSAIFwd, gDim, bDim,
+                        num_rows, A_i, A_j, g_diag, g_scale, q_packed, b_data, y_work );
+
+      HYPRE_GPU_LAUNCH( hypre_GPUKernelBitFSAITr, gDim, bDim,
+                        num_rows, alpha, omega, A_i, A_j, g_diag, g_scale, q_packed, y_work, x_data );
+   }
+
+   return hypre_error_flag;
+#else
+   HYPRE_UNUSED_VAR(fsai_vdata);
+   HYPRE_UNUSED_VAR(alpha);
+   HYPRE_UNUSED_VAR(b);
+   HYPRE_UNUSED_VAR(x);
+   hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                     "Device BitFSAI (algo_type = 4) requires CUDA or HIP with real arithmetic!\n");
+   return hypre_error_flag;
+#endif
+}
 
 /*--------------------------------------------------------------------------
  * hypre_FSAISetupDevice

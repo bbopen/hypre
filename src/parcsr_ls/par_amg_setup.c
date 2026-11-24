@@ -3675,6 +3675,7 @@ hypre_BoomerAMGSetup( void               *amg_vdata,
                          (HYPRE_ParVector) U_array[j]);
 
 #if DEBUG_SAVE_ALL_OPS
+         if (hypre_ParFSAIDataGmat((hypre_ParFSAIData*) smoother[j]))
          {
             char filename[256];
             hypre_sprintf(filename, "G_%02d.IJ.out", j);

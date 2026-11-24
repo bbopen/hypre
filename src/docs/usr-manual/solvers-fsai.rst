@@ -98,4 +98,12 @@ Implementation Notes
   vendor implementations of BLAS/LAPACK for better setup performance of FSAI, regardless
   of whether using OpenMP or not.
 
-* The GPU version of FSAI is under development.
+* The GPU version of FSAI is under development. Setting ``algo_type = 4``
+  via ``HYPRE_FSAISetAlgoType(solver, 4)`` or
+  ``HYPRE_BoomerAMGSetFSAIAlgoType(amg, 4)`` selects the 4-bit zero-index
+  factorized smoother (BitFSAI), which reuses the sparsity indices of
+  :math:`A_{\text{diag}}` with split-scale signed INT4 off-diagonal weights,
+  per-row :math:`2 \times 2` :math:`A`-energy re-projection, and a scale-factored
+  transpose pass (real arithmetic only; 8 B/row FP64 intermediate on double
+  builds, 4 B/row FP32 on single builds with automatic wide promotion on
+  extreme scales) on both host and GPU (CUDA/HIP).

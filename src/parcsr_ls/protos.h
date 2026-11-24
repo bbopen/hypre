@@ -2175,6 +2175,7 @@ HYPRE_Int hypre_BoomerAMGDD_FixUpRecvMaps ( hypre_AMGDDCompGrid **compGrid,
 /* par_fsai.c */
 void* hypre_FSAICreate( void );
 HYPRE_Int hypre_FSAIDestroy ( void *data );
+HYPRE_Int hypre_FSAIFreeBitFSAI ( void *data );
 HYPRE_Int hypre_FSAISetAlgoType ( void *data, HYPRE_Int algo_type );
 HYPRE_Int hypre_FSAISetLocalSolveType ( void *data, HYPRE_Int local_solve_type );
 HYPRE_Int hypre_FSAISetMaxSteps ( void *data, HYPRE_Int max_steps );
@@ -2243,3 +2244,6 @@ HYPRE_Int hypre_FSAIApply ( void *fsai_vdata, HYPRE_Complex alpha, hypre_ParVect
 /* par_fsai_device.c */
 HYPRE_Int hypre_FSAISetupDevice( void *fsai_vdata, hypre_ParCSRMatrix *A,
                                  hypre_ParVector *f, hypre_ParVector *u );
+HYPRE_Int hypre_FSAISetupBitFSAIDevice( void *fsai_vdata, hypre_ParCSRMatrix *A );
+HYPRE_Int hypre_FSAIApplyBitFSAIDevice( void *fsai_vdata, HYPRE_Complex alpha,
+                                        hypre_ParVector *b, hypre_ParVector *x );

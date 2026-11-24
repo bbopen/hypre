@@ -4905,6 +4905,14 @@ hypre_FSAIDumpLocalLSDense( void *fsai_vdata, const char *filename, hypre_ParCSR
 /*--------------------------------------------------------------------------*/
 
 HYPRE_Int
+hypre_FSAIFreeBitFSAI( void *data )
+{
+   return HYPRE_CURRENTPRECISION_FUNC(hypre_FSAIFreeBitFSAI)( data );
+}
+
+/*--------------------------------------------------------------------------*/
+
+HYPRE_Int
 hypre_FSAIGetAlgoType( void *data, HYPRE_Int *algo_type )
 {
    return HYPRE_CURRENTPRECISION_FUNC(hypre_FSAIGetAlgoType)( data, algo_type );

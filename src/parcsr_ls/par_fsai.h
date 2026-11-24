@@ -34,6 +34,18 @@ typedef struct hypre_ParFSAIData_struct
    hypre_ParCSRMatrix   *Gmat;             /* Matrix holding FSAI factor. M^(-1) = G'G */
    hypre_ParCSRMatrix   *GTmat;            /* Matrix holding the transpose of the FSAI factor */
 
+   /* BitFSAI (algo_type == 4) zero-duplicate-index 4-bit factor data */
+   hypre_CSRMatrix      *bitfsai_A_diag;     /* Non-owning pointer to A_diag (CSR indices reused) */
+   HYPRE_Int             bitfsai_num_rows;   /* Local number of rows */
+   HYPRE_Int             bitfsai_nnz;        /* Local number of nonzeros in A_diag */
+   HYPRE_Int             bitfsai_wide_apply; /* Use 8 B/row FP64 intermediate when needed */
+   HYPRE_MemoryLocation  bitfsai_memloc;     /* Memory location of BitFSAI arrays */
+   float                *bitfsai_g_diag;     /* FP32 diagonal entries g_{ii} */
+   float                *bitfsai_g_scale;    /* FP32 per-row off-diagonal scale s_i */
+   unsigned char        *bitfsai_q_packed;   /* Packed 4-bit symmetric signed nibbles */
+   float                *bitfsai_y_work;     /* Scale-factored FP32 Pass-1 buffer y_i = s_i t_i */
+   double               *bitfsai_t_work;     /* Unscaled FP64 Pass-1 buffer t_i (wide apply) */
+
    /* Solver data */
    HYPRE_Int             zero_guess;       /* Flag indicating x0 = 0 */
    HYPRE_Int             eig_max_iters;    /* Iters for computing max. eigenvalue of G^T*G*A */
@@ -70,6 +82,18 @@ typedef struct hypre_ParFSAIData_struct
 #define hypre_ParFSAIDataGmat(fsai_data)                    ((fsai_data) -> Gmat)
 #define hypre_ParFSAIDataGTmat(fsai_data)                   ((fsai_data) -> GTmat)
 #define hypre_ParFSAIDataDensity(fsai_data)                 ((fsai_data) -> density)
+
+/* BitFSAI (algo_type == 4) data */
+#define hypre_ParFSAIDataBitFSAIADiag(fsai_data)            ((fsai_data) -> bitfsai_A_diag)
+#define hypre_ParFSAIDataBitFSAINumRows(fsai_data)          ((fsai_data) -> bitfsai_num_rows)
+#define hypre_ParFSAIDataBitFSAINnz(fsai_data)              ((fsai_data) -> bitfsai_nnz)
+#define hypre_ParFSAIDataBitFSAIWideApply(fsai_data)        ((fsai_data) -> bitfsai_wide_apply)
+#define hypre_ParFSAIDataBitFSAIMemLoc(fsai_data)           ((fsai_data) -> bitfsai_memloc)
+#define hypre_ParFSAIDataBitFSAIGDiag(fsai_data)            ((fsai_data) -> bitfsai_g_diag)
+#define hypre_ParFSAIDataBitFSAIGScale(fsai_data)           ((fsai_data) -> bitfsai_g_scale)
+#define hypre_ParFSAIDataBitFSAIQPacked(fsai_data)          ((fsai_data) -> bitfsai_q_packed)
+#define hypre_ParFSAIDataBitFSAIYWork(fsai_data)            ((fsai_data) -> bitfsai_y_work)
+#define hypre_ParFSAIDataBitFSAITWork(fsai_data)            ((fsai_data) -> bitfsai_t_work)
 
 /* Solver problem data */
 #define hypre_ParFSAIDataZeroGuess(fsai_data)               ((fsai_data) -> zero_guess)

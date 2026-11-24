@@ -227,6 +227,22 @@ hypre_BoomerAMGRelaxTwoStageGaussSeidelDevice( hypre_ParCSRMatrix *A, hypre_ParV
 /*--------------------------------------------------------------------------*/
 
 HYPRE_Int
+hypre_FSAIApplyBitFSAIDevice( void *fsai_vdata, HYPRE_Complex alpha, hypre_ParVector *b, hypre_ParVector *x )
+{
+   return HYPRE_CURRENTPRECISION_FUNC(hypre_FSAIApplyBitFSAIDevice)( fsai_vdata, alpha, b, x );
+}
+
+/*--------------------------------------------------------------------------*/
+
+HYPRE_Int
+hypre_FSAISetupBitFSAIDevice( void *fsai_vdata, hypre_ParCSRMatrix *A )
+{
+   return HYPRE_CURRENTPRECISION_FUNC(hypre_FSAISetupBitFSAIDevice)( fsai_vdata, A );
+}
+
+/*--------------------------------------------------------------------------*/
+
+HYPRE_Int
 hypre_FSAISetupDevice( void *fsai_vdata, hypre_ParCSRMatrix *A, hypre_ParVector *f, hypre_ParVector *u )
 {
    return HYPRE_CURRENTPRECISION_FUNC(hypre_FSAISetupDevice)( fsai_vdata, A, f, u );

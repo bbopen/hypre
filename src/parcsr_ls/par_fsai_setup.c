@@ -8,6 +8,7 @@
 #include "_hypre_parcsr_ls.h"
 #include "_hypre_blas.h"
 #include "_hypre_lapack.h"
+#include <float.h>
 
 /*****************************************************************************
  *
@@ -910,6 +911,602 @@ hypre_FSAISetupOMPDyn( void               *fsai_vdata,
 }
 
 /*--------------------------------------------------------------------------
+ * hypre_BitFSAIFindPosHost
+ *--------------------------------------------------------------------------*/
+
+static HYPRE_Int
+hypre_BitFSAIFindPosHost( const HYPRE_Int *A_i,
+                          const HYPRE_Int *A_j,
+                          HYPRE_Int        row,
+                          HYPRE_Int        target_col )
+{
+   HYPRE_Int k;
+   for (k = A_i[row]; k < A_i[row + 1]; k++)
+   {
+      if (A_j[k] == target_col)
+      {
+         return k;
+      }
+   }
+   return -1;
+}
+
+/*--------------------------------------------------------------------------
+ * hypre_FSAISetupBitFSAIHost
+ *
+ * Zero-duplicate-index 4-bit split-scale BitFSAI setup on host.
+ * Computes local lower-triangular Cholesky patches directly on A_diag,
+ * quantizes off-diagonal entries to symmetric signed INT4 nibbles, applies
+ * 2x2 A-energy re-projection, and mirrors nibbles onto A_diag's CSR slots.
+ *--------------------------------------------------------------------------*/
+
+static HYPRE_Int
+hypre_BitFSAIIsFiniteHost( double v )
+{
+   return (v == v && v >= -DBL_MAX && v <= DBL_MAX);
+}
+
+static HYPRE_Int
+hypre_BitFSAIIsStorableF32Host( double v )
+{
+   float s = (float) v;
+   return (hypre_BitFSAIIsFiniteHost(v) && s == s && s != 0.0f && s >= -FLT_MAX && s <= FLT_MAX);
+}
+
+static HYPRE_Int
+hypre_BitFSAIProjectRowHost( HYPRE_Int            m,
+                             const double        *q_dec,
+                             const double        *L,
+                             const double        *A_patch,
+                             double              *diag_out,
+                             double              *scale_out )
+{
+   HYPRE_Int a, b;
+   double c11 = 0.0;
+   double c12 = 0.0;
+   double projection;
+   double residual_sq = 0.0;
+   double g_opt, s_opt;
+   float g_f32, s_f32;
+   double sg, ss;
+   double energy = 0.0;
+   double comp = 0.0;
+   double sum_abs = 0.0;
+   double bound;
+
+   if (m < 2)
+   {
+      return 0;
+   }
+   if (!(A_patch[(m - 1) * 16 + (m - 1)] > 0.0) ||
+       !hypre_BitFSAIIsFiniteHost(A_patch[(m - 1) * 16 + (m - 1)]))
+   {
+      return -1;
+   }
+
+   for (b = 0; b < m - 1; b++)
+   {
+      double ub = 0.0;
+      for (a = b; a < m - 1; a++)
+      {
+         ub += L[a * 16 + b] * q_dec[a];
+      }
+      c11 += ub * ub;
+      c12 += ub * L[(m - 1) * 16 + b];
+   }
+   if (!(c11 > 0.0) || !hypre_BitFSAIIsFiniteHost(c11) || !hypre_BitFSAIIsFiniteHost(c12))
+   {
+      return 0;
+   }
+
+   projection = c12 / c11;
+   if (!hypre_BitFSAIIsFiniteHost(projection))
+   {
+      return 0;
+   }
+
+   /* Orthogonal residual avoids cancellation in c11 * c22 - c12^2 */
+   for (b = 0; b < m; b++)
+   {
+      double ub = 0.0;
+      double res;
+      if (b < m - 1)
+      {
+         for (a = b; a < m - 1; a++)
+         {
+            ub += L[a * 16 + b] * q_dec[a];
+         }
+      }
+      res = L[(m - 1) * 16 + b] - projection * ub;
+      residual_sq += res * res;
+   }
+   if (!(residual_sq > 0.0) || !hypre_BitFSAIIsFiniteHost(residual_sq))
+   {
+      return 0;
+   }
+
+   g_opt = 1.0 / sqrt(residual_sq);
+   s_opt = -projection * g_opt;
+   if (!(g_opt > 0.0) || !hypre_BitFSAIIsFiniteHost(g_opt) || !hypre_BitFSAIIsFiniteHost(s_opt))
+   {
+      return 0;
+   }
+
+   g_f32 = (float) g_opt;
+   s_f32 = (float) s_opt;
+   if (s_f32 == 0.0f)
+   {
+      return 0;
+   }
+   if (!hypre_BitFSAIIsStorableF32Host(g_opt) || !hypre_BitFSAIIsStorableF32Host(s_opt))
+   {
+      return -2;
+   }
+
+   sg = (double) g_f32;
+   ss = (double) s_f32;
+   for (a = 0; a < m; a++)
+   {
+      double wa = (a == m - 1) ? sg : (ss * q_dec[a]);
+      for (b = 0; b < m; b++)
+      {
+         double wb = (b == m - 1) ? sg : (ss * q_dec[b]);
+         double a_ab = (a >= b) ? A_patch[a * 16 + b] : A_patch[b * 16 + a];
+         double term = wa * a_ab * wb;
+         double adj, next;
+         if (!hypre_BitFSAIIsFiniteHost(term))
+         {
+            return -2;
+         }
+         adj = term - comp;
+         next = energy + adj;
+         comp = (next - energy) - adj;
+         energy = next;
+         sum_abs += fabs(term);
+      }
+   }
+   if (!hypre_BitFSAIIsFiniteHost(energy) || !hypre_BitFSAIIsFiniteHost(sum_abs))
+   {
+      return -2;
+   }
+   bound = 8.0 * DBL_EPSILON * sum_abs;
+   if (!(fabs(energy - 1.0) + bound <= 1.0e-4))
+   {
+      return 0;
+   }
+
+   *diag_out  = g_opt;
+   *scale_out = s_opt;
+   return 1;
+}
+
+static HYPRE_Int
+hypre_FSAISetupBitFSAIHost( void               *fsai_vdata,
+                            hypre_ParCSRMatrix *A )
+{
+#if defined(HYPRE_COMPLEX)
+   HYPRE_UNUSED_VAR(fsai_vdata);
+   HYPRE_UNUSED_VAR(A);
+   hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                     "BitFSAI (algo_type = 4) does not support complex arithmetic\n");
+   return hypre_error_flag;
+#else
+   hypre_ParFSAIData *fsai_data   = (hypre_ParFSAIData*) fsai_vdata;
+   HYPRE_Int          max_nnz_row = hypre_ParFSAIDataMaxNnzRow(fsai_data);
+   hypre_CSRMatrix   *A_diag      = hypre_ParCSRMatrixDiag(A);
+   HYPRE_Int          num_rows    = hypre_CSRMatrixNumRows(A_diag);
+   HYPRE_Int          nnz         = hypre_CSRMatrixNumNonzeros(A_diag);
+   HYPRE_Int         *A_i         = hypre_CSRMatrixI(A_diag);
+   HYPRE_Int         *A_j         = hypre_CSRMatrixJ(A_diag);
+   HYPRE_Complex     *A_a         = hypre_CSRMatrixData(A_diag);
+   HYPRE_Int          patch_cap;
+   HYPRE_Int          packed_bytes;
+   HYPRE_Int          i;
+   HYPRE_Int          err_invalid_diag = 0;
+   HYPRE_Int          err_unrep        = 0;
+   HYPRE_Int          err_nonsym       = 0;
+   HYPRE_Int          wide_apply       = 0;
+   float             *g_diag;
+   float             *g_scale;
+   unsigned char     *q_tmp;
+   unsigned char     *q_packed;
+   float             *y_work = NULL;
+   double            *t_work = NULL;
+
+   hypre_FSAIFreeBitFSAI(fsai_vdata);
+
+   hypre_ParFSAIDataBitFSAIADiag(fsai_data)   = A_diag;
+   hypre_ParFSAIDataBitFSAINumRows(fsai_data) = num_rows;
+   hypre_ParFSAIDataBitFSAINnz(fsai_data)     = nnz;
+   hypre_ParFSAIDataBitFSAIMemLoc(fsai_data)  = HYPRE_MEMORY_HOST;
+
+   if (num_rows <= 0)
+   {
+      return hypre_error_flag;
+   }
+
+   if (max_nnz_row > 0)
+   {
+      patch_cap = (max_nnz_row > 16) ? 16 : max_nnz_row;
+   }
+   else
+   {
+      double avg_deg = (double) nnz / (double) num_rows;
+      patch_cap = (avg_deg > 22.0) ? 8 : 12;
+   }
+
+   packed_bytes = (nnz / 2) + (nnz % 2);
+   g_diag   = hypre_TAlloc(float, num_rows, HYPRE_MEMORY_HOST);
+   g_scale  = hypre_TAlloc(float, num_rows, HYPRE_MEMORY_HOST);
+   q_packed = hypre_TAlloc(unsigned char, (packed_bytes > 0) ? packed_bytes : 1, HYPRE_MEMORY_HOST);
+   q_tmp    = hypre_TAlloc(unsigned char, (nnz > 0) ? nnz : 1, HYPRE_MEMORY_HOST);
+
+   if (nnz > 0)
+   {
+      hypre_Memset(q_tmp, 8, (size_t) nnz * sizeof(unsigned char), HYPRE_MEMORY_HOST);
+   }
+
+#if !defined(HYPRE_SINGLE)
+   wide_apply = 1;
+#endif
+
+#ifdef HYPRE_USING_OPENMP
+#pragma omp parallel for schedule(guided) private(i) reduction(|:err_invalid_diag,err_unrep,err_nonsym,wide_apply)
+#endif
+   for (i = 0; i < num_rows; i++)
+   {
+      HYPRE_Int     J[16];
+      HYPRE_Int     Klow[16];
+      HYPRE_Int     Kup[16];
+      double        a_off[16];
+      double        A_patch[16 * 16];
+      double        L[16 * 16];
+      double        g_off[16];
+      double        q_dec[16];
+      unsigned char q_code[16];
+      HYPRE_Int     rs = A_i[i];
+      HYPRE_Int     re = A_i[i + 1];
+      HYPRE_Int     k, a, b, c;
+      HYPRE_Int     m_off = 0;
+      HYPRE_Int     m;
+      HYPRE_Int     ok = 1;
+      HYPRE_Int     found_diag = 0;
+      HYPRE_Int     diagonal_only = 0;
+      double        a_ii = 0.0;
+      double        g_d = 0.0;
+      double        scale = 0.0;
+
+      for (k = rs; k < re; k++)
+      {
+         HYPRE_Int col = A_j[k];
+         double    val = (double) A_a[k];
+         if (col == i)
+         {
+            a_ii = val;
+            found_diag = 1;
+         }
+         else if (col < i)
+         {
+            HYPRE_Int k_up = hypre_BitFSAIFindPosHost(A_i, A_j, col, i);
+            if (k_up < 0)
+            {
+               err_nonsym = 1;
+               continue;
+            }
+            if (m_off < patch_cap - 1)
+            {
+               J[m_off]     = col;
+               Klow[m_off]  = k;
+               Kup[m_off]   = k_up;
+               a_off[m_off] = val;
+               m_off++;
+            }
+            else if (patch_cap > 1)
+            {
+               HYPRE_Int min_idx = 0;
+               double    min_abs = fabs(a_off[0]);
+               for (a = 1; a < m_off; a++)
+               {
+                  double av = fabs(a_off[a]);
+                  if (av < min_abs)
+                  {
+                     min_abs = av;
+                     min_idx = a;
+                  }
+               }
+               if (fabs(val) > min_abs)
+               {
+                  J[min_idx]     = col;
+                  Klow[min_idx]  = k;
+                  Kup[min_idx]   = k_up;
+                  a_off[min_idx] = val;
+               }
+            }
+         }
+         else
+         {
+            if (hypre_BitFSAIFindPosHost(A_i, A_j, col, i) < 0)
+            {
+               err_nonsym = 1;
+            }
+         }
+      }
+
+      if (!found_diag || !(a_ii > 0.0) || !hypre_BitFSAIIsFiniteHost(a_ii))
+      {
+         err_invalid_diag = 1;
+         g_diag[i]  = 1.0f;
+         g_scale[i] = 1.0f;
+         continue;
+      }
+
+      if (m_off == 0)
+      {
+         diagonal_only = 1;
+         g_d   = 1.0 / sqrt(a_ii);
+         scale = g_d;
+      }
+      else
+      {
+         m = m_off + 1;
+         for (a = 0; a < m; a++)
+         {
+            for (b = 0; b <= a; b++)
+            {
+               A_patch[a * 16 + b] = 0.0;
+            }
+         }
+
+         for (a = 0; a < m_off; a++)
+         {
+            HYPRE_Int ra = J[a];
+            for (k = A_i[ra]; k < A_i[ra + 1]; k++)
+            {
+               HYPRE_Int col = A_j[k];
+               for (b = 0; b <= a; b++)
+               {
+                  if (J[b] == col)
+                  {
+                     A_patch[a * 16 + b] = (double) A_a[k];
+                     break;
+                  }
+               }
+            }
+            A_patch[(m - 1) * 16 + a] = a_off[a];
+         }
+         A_patch[(m - 1) * 16 + (m - 1)] = a_ii;
+
+         for (a = 0; a < m; a++)
+         {
+            for (b = 0; b <= a; b++)
+            {
+               L[a * 16 + b] = A_patch[a * 16 + b];
+            }
+         }
+
+         /* Cholesky factorization L L^T = A_patch */
+         for (a = 0; a < m && ok; a++)
+         {
+            for (b = 0; b <= a; b++)
+            {
+               double s = L[a * 16 + b];
+               for (c = 0; c < b; c++)
+               {
+                  s -= L[a * 16 + c] * L[b * 16 + c];
+               }
+               if (a == b)
+               {
+                  if (!(s > 0.0) || !hypre_BitFSAIIsFiniteHost(s))
+                  {
+                     ok = 0;
+                     break;
+                  }
+                  L[a * 16 + a] = sqrt(s);
+               }
+               else
+               {
+                  double lv = s / L[b * 16 + b];
+                  if (!hypre_BitFSAIIsFiniteHost(lv))
+                  {
+                     ok = 0;
+                     break;
+                  }
+                  L[a * 16 + b] = lv;
+               }
+            }
+         }
+
+         if (ok)
+         {
+            g_d = 1.0 / L[(m - 1) * 16 + (m - 1)];
+            if (!hypre_BitFSAIIsFiniteHost(g_d))
+            {
+               ok = 0;
+            }
+            else
+            {
+               for (a = m_off - 1; a >= 0; a--)
+               {
+                  double s = -L[(m - 1) * 16 + a] * g_d;
+                  for (b = a + 1; b < m_off; b++)
+                  {
+                     s -= L[b * 16 + a] * g_off[b];
+                  }
+                  g_off[a] = s / L[a * 16 + a];
+                  if (!hypre_BitFSAIIsFiniteHost(g_off[a]))
+                  {
+                     ok = 0;
+                     break;
+                  }
+               }
+            }
+         }
+
+         if (!ok)
+         {
+            diagonal_only = 1;
+            g_d   = 1.0 / sqrt(a_ii);
+            scale = g_d;
+         }
+         else
+         {
+            scale = 0.0;
+            for (a = 0; a < m_off; a++)
+            {
+               double av = fabs(g_off[a]);
+               if (av > scale)
+               {
+                  scale = av;
+               }
+            }
+
+            if (!(scale > 0.0) || !hypre_BitFSAIIsFiniteHost(scale))
+            {
+               diagonal_only = 1;
+               g_d   = 1.0 / sqrt(a_ii);
+               scale = g_d;
+            }
+            else
+            {
+               for (a = 0; a < m_off; a++)
+               {
+                  double    u = 7.0 * (g_off[a] / scale);
+                  HYPRE_Int q = (HYPRE_Int)(u >= 0.0 ? floor(u + 0.5) : ceil(u - 0.5));
+                  if (q > 7)  { q = 7; }
+                  if (q < -7) { q = -7; }
+                  q_code[a] = (unsigned char)(q + 8);
+                  q_dec[a]  = (double)(((float) q) * (1.0f / 7.0f));
+               }
+
+               {
+                  HYPRE_Int proj_rc = hypre_BitFSAIProjectRowHost(m, q_dec, L, A_patch, &g_d, &scale);
+                  if (proj_rc == -1)
+                  {
+                     err_invalid_diag = 1;
+                     g_diag[i]  = 1.0f;
+                     g_scale[i] = 1.0f;
+                     continue;
+                  }
+                  if (proj_rc == -2)
+                  {
+                     err_unrep = 1;
+                     g_diag[i]  = 1.0f;
+                     g_scale[i] = 1.0f;
+                     continue;
+                  }
+                  if (proj_rc == 0)
+                  {
+                     diagonal_only = 1;
+                     g_d   = 1.0 / sqrt(a_ii);
+                     scale = g_d;
+                     for (a = 0; a < m_off; a++)
+                     {
+                        q_code[a] = 8;
+                     }
+                  }
+                  else
+                  {
+                     for (a = 0; a < m_off; a++)
+                     {
+                        q_tmp[Klow[a]] = q_code[a];
+                        q_tmp[Kup[a]]  = q_code[a];
+                     }
+                  }
+               }
+            }
+         }
+      }
+
+      if (!hypre_BitFSAIIsStorableF32Host(g_d) || !hypre_BitFSAIIsStorableF32Host(scale))
+      {
+         err_unrep = 1;
+         g_diag[i]  = 1.0f;
+         g_scale[i] = 1.0f;
+         continue;
+      }
+      if (diagonal_only)
+      {
+         double sd = (double)(float) g_d;
+         double se = sd * sd * a_ii;
+         if (!hypre_BitFSAIIsFiniteHost(se) || fabs(se - 1.0) > 1.0e-4)
+         {
+            err_unrep = 1;
+            g_diag[i]  = 1.0f;
+            g_scale[i] = 1.0f;
+            continue;
+         }
+      }
+
+      {
+         double ratio = fabs(scale) / g_d;
+         if (ratio < 1e-6 || ratio > 1e6 ||
+             fabs(scale) < sqrt((double) FLT_MIN) ||
+             fabs(scale) > sqrt((double) FLT_MAX))
+         {
+            wide_apply = 1;
+         }
+      }
+
+      g_diag[i]  = (float) g_d;
+      g_scale[i] = (float) scale;
+   }
+
+   for (i = 0; i < packed_bytes; i++)
+   {
+      unsigned char lo = q_tmp[2 * i] & 0x0F;
+      unsigned char hi = (2 * i + 1 < nnz) ? (q_tmp[2 * i + 1] & 0x0F) : 8;
+      q_packed[i] = (unsigned char)(lo | (hi << 4));
+   }
+
+   hypre_TFree(q_tmp, HYPRE_MEMORY_HOST);
+
+   if (err_invalid_diag || err_unrep || err_nonsym)
+   {
+      hypre_TFree(g_diag, HYPRE_MEMORY_HOST);
+      hypre_TFree(g_scale, HYPRE_MEMORY_HOST);
+      hypre_TFree(q_packed, HYPRE_MEMORY_HOST);
+      hypre_ParFSAIDataBitFSAIADiag(fsai_data)   = NULL;
+      hypre_ParFSAIDataBitFSAINumRows(fsai_data) = 0;
+      hypre_ParFSAIDataBitFSAINnz(fsai_data)     = 0;
+      if (err_nonsym)
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) requires structurally symmetric (mirrored) A_diag\n");
+      }
+      else if (err_invalid_diag)
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) requires finite strictly positive diagonals\n");
+      }
+      else
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) factor cannot be represented in FP32\n");
+      }
+      return hypre_error_flag;
+   }
+
+   if (wide_apply)
+   {
+      t_work = hypre_TAlloc(double, num_rows, HYPRE_MEMORY_HOST);
+   }
+   else
+   {
+      y_work = hypre_TAlloc(float, num_rows, HYPRE_MEMORY_HOST);
+   }
+
+   hypre_ParFSAIDataBitFSAIWideApply(fsai_data) = wide_apply;
+   hypre_ParFSAIDataBitFSAIGDiag(fsai_data)     = g_diag;
+   hypre_ParFSAIDataBitFSAIGScale(fsai_data)    = g_scale;
+   hypre_ParFSAIDataBitFSAIQPacked(fsai_data)   = q_packed;
+   hypre_ParFSAIDataBitFSAIYWork(fsai_data)     = y_work;
+   hypre_ParFSAIDataBitFSAITWork(fsai_data)     = t_work;
+
+   return hypre_error_flag;
+#endif
+}
+
+/*--------------------------------------------------------------------------
  * hypre_FSAISetup
  *--------------------------------------------------------------------------*/
 
@@ -958,67 +1555,138 @@ hypre_FSAISetup( void               *fsai_vdata,
 
    hypre_SolverResetIsSetup((hypre_Solver *) fsai_vdata);
 
+   /* Release any previously owned setup buffers to avoid leaks on re-setup */
+   if (hypre_ParFSAIDataRWork(fsai_data))
+   {
+      hypre_ParVectorDestroy(hypre_ParFSAIDataRWork(fsai_data));
+      hypre_ParFSAIDataRWork(fsai_data) = NULL;
+   }
+   if (hypre_ParFSAIDataZWork(fsai_data))
+   {
+      hypre_ParVectorDestroy(hypre_ParFSAIDataZWork(fsai_data));
+      hypre_ParFSAIDataZWork(fsai_data) = NULL;
+   }
+   if (hypre_ParFSAIDataGmat(fsai_data))
+   {
+      hypre_ParCSRMatrixDestroy(hypre_ParFSAIDataGmat(fsai_data));
+      hypre_ParFSAIDataGmat(fsai_data) = NULL;
+   }
+   if (hypre_ParFSAIDataGTmat(fsai_data))
+   {
+      hypre_ParCSRMatrixDestroy(hypre_ParFSAIDataGTmat(fsai_data));
+      hypre_ParFSAIDataGTmat(fsai_data) = NULL;
+   }
+   hypre_FSAIFreeBitFSAI(fsai_vdata);
+
    /* Create and initialize work vectors used in the solve phase */
    r_work = hypre_ParVectorCreate(comm, num_rows_A, row_starts_A);
-   z_work = hypre_ParVectorCreate(comm, num_rows_A, row_starts_A);
-
    hypre_ParVectorInitialize(r_work);
-   hypre_ParVectorInitialize(z_work);
-
    hypre_ParFSAIDataRWork(fsai_data) = r_work;
-   hypre_ParFSAIDataZWork(fsai_data) = z_work;
 
-   /* Create the matrix G */
-   if (algo_type == 1 || algo_type == 2)
+   if (algo_type == 4)
    {
-      max_nnzrow_diag_G = max_steps * max_step_size + 1;
-   }
-   else
-   {
-      max_nnzrow_diag_G = max_nnz_row + 1;
-   }
-   max_nonzeros_diag_G = num_rows_diag_A * max_nnzrow_diag_G;
-   G = hypre_ParCSRMatrixCreate(comm, num_rows_A, num_cols_A,
-                                row_starts_A, col_starts_A,
-                                0, max_nonzeros_diag_G, 0);
-   hypre_ParFSAIDataGmat(fsai_data) = G;
+      HYPRE_Int local_err = 0;
+      HYPRE_Int global_err = 0;
 
-   /* Initialize and compute lower triangular factor G */
+      hypre_ParFSAIDataZWork(fsai_data) = NULL;
+      hypre_ParFSAIDataGmat(fsai_data)  = NULL;
+      hypre_ParFSAIDataGTmat(fsai_data) = NULL;
+
 #if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
-   HYPRE_MemoryLocation  memloc_A = hypre_ParCSRMatrixMemoryLocation(A);
-   HYPRE_ExecutionPolicy exec = hypre_GetExecPolicy1(memloc_A);
+      HYPRE_MemoryLocation  memloc_A = hypre_ParCSRMatrixMemoryLocation(A);
+      HYPRE_ExecutionPolicy exec = hypre_GetExecPolicy1(memloc_A);
 
-   if (exec == HYPRE_EXEC_DEVICE)
-   {
-      hypre_FSAISetupDevice(fsai_vdata, A, f, u);
-   }
-   else
-#endif
-   {
-      /* Initialize matrix */
-      hypre_ParCSRMatrixInitialize(G);
-
-      switch (algo_type)
+      if (exec == HYPRE_EXEC_DEVICE)
       {
-         case 1:
-            // TODO: Change name to hypre_FSAISetupAdaptive
-            hypre_FSAISetupNative(fsai_vdata, A, f, u);
-            break;
+         hypre_FSAISetupBitFSAIDevice(fsai_vdata, A);
+      }
+      else
+#elif defined(HYPRE_USING_GPU)
+      HYPRE_MemoryLocation  memloc_A = hypre_ParCSRMatrixMemoryLocation(A);
+      HYPRE_ExecutionPolicy exec = hypre_GetExecPolicy1(memloc_A);
 
-         case 2:
-            // TODO: Change name to hypre_FSAISetupAdaptiveOMPDynamic
-            hypre_FSAISetupOMPDyn(fsai_vdata, A, f, u);
-            break;
+      if (exec == HYPRE_EXEC_DEVICE)
+      {
+         hypre_error_w_msg(HYPRE_ERROR_GENERIC,
+                           "BitFSAI (algo_type = 4) device execution requires CUDA or HIP\n");
+      }
+      else
+#endif
+      {
+         hypre_FSAISetupBitFSAIHost(fsai_vdata, A);
+      }
 
-         default:
-            hypre_FSAISetupNative(fsai_vdata, A, f, u);
-            break;
+      local_err = (hypre_error_flag != 0) ? 1 : 0;
+      hypre_MPI_Allreduce(&local_err, &global_err, 1, HYPRE_MPI_INT, hypre_MPI_LOR, comm);
+      if (global_err)
+      {
+         hypre_FSAIFreeBitFSAI(fsai_vdata);
+         if (!hypre_error_flag)
+         {
+            hypre_error(HYPRE_ERROR_GENERIC);
+         }
+         HYPRE_ANNOTATE_FUNC_END;
+         return hypre_error_flag;
       }
    }
+   else
+   {
+      z_work = hypre_ParVectorCreate(comm, num_rows_A, row_starts_A);
+      hypre_ParVectorInitialize(z_work);
+      hypre_ParFSAIDataZWork(fsai_data) = z_work;
 
-   /* Compute G^T */
-   G  = hypre_ParFSAIDataGmat(fsai_data);
-   hypre_ParCSRMatrixTranspose(G, &hypre_ParFSAIDataGTmat(fsai_data), 1);
+      /* Create the matrix G */
+      if (algo_type == 1 || algo_type == 2)
+      {
+         max_nnzrow_diag_G = max_steps * max_step_size + 1;
+      }
+      else
+      {
+         max_nnzrow_diag_G = max_nnz_row + 1;
+      }
+      max_nonzeros_diag_G = num_rows_diag_A * max_nnzrow_diag_G;
+      G = hypre_ParCSRMatrixCreate(comm, num_rows_A, num_cols_A,
+                                   row_starts_A, col_starts_A,
+                                   0, max_nonzeros_diag_G, 0);
+      hypre_ParFSAIDataGmat(fsai_data) = G;
+
+      /* Initialize and compute lower triangular factor G */
+#if defined(HYPRE_USING_CUDA) || defined(HYPRE_USING_HIP)
+      HYPRE_MemoryLocation  memloc_A = hypre_ParCSRMatrixMemoryLocation(A);
+      HYPRE_ExecutionPolicy exec = hypre_GetExecPolicy1(memloc_A);
+
+      if (exec == HYPRE_EXEC_DEVICE)
+      {
+         hypre_FSAISetupDevice(fsai_vdata, A, f, u);
+      }
+      else
+#endif
+      {
+         /* Initialize matrix */
+         hypre_ParCSRMatrixInitialize(G);
+
+         switch (algo_type)
+         {
+            case 1:
+               // TODO: Change name to hypre_FSAISetupAdaptive
+               hypre_FSAISetupNative(fsai_vdata, A, f, u);
+               break;
+
+            case 2:
+               // TODO: Change name to hypre_FSAISetupAdaptiveOMPDynamic
+               hypre_FSAISetupOMPDyn(fsai_vdata, A, f, u);
+               break;
+
+            default:
+               hypre_FSAISetupNative(fsai_vdata, A, f, u);
+               break;
+         }
+      }
+
+      /* Compute G^T */
+      G  = hypre_ParFSAIDataGmat(fsai_data);
+      hypre_ParCSRMatrixTranspose(G, &hypre_ParFSAIDataGTmat(fsai_data), 1);
+   }
 
    /* Update omega if requested */
    if (eig_max_iters)
@@ -1031,10 +1699,10 @@ hypre_FSAISetup( void               *fsai_vdata,
    {
       hypre_FSAIPrintStats(fsai_data, A);
    }
-   else if (print_level > 2)
+   else if (print_level > 2 && hypre_ParFSAIDataGmat(fsai_data))
    {
       char filename[] = "FSAI.out.G.ij";
-      hypre_ParCSRMatrixPrintIJ(G, 0, 0, filename);
+      hypre_ParCSRMatrixPrintIJ(hypre_ParFSAIDataGmat(fsai_data), 0, 0, filename);
    }
 
 #if defined (DEBUG_FSAI)
@@ -1085,10 +1753,26 @@ hypre_FSAIPrintStats( void *fsai_vdata,
    hypre_MPI_Comm_rank(hypre_ParCSRMatrixComm(A), &my_id);
 
    /* Compute density */
-   hypre_ParCSRMatrixSetDNumNonzeros(G);
-   hypre_ParCSRMatrixSetDNumNonzeros(A);
-   density = (HYPRE_Real)(hypre_ParCSRMatrixDNumNonzeros(G) /
-                          hypre_ParCSRMatrixDNumNonzeros(A));
+   if (G)
+   {
+      hypre_ParCSRMatrixSetDNumNonzeros(G);
+      hypre_ParCSRMatrixSetDNumNonzeros(A);
+      density = (HYPRE_Real)(hypre_ParCSRMatrixDNumNonzeros(G) /
+                             hypre_ParCSRMatrixDNumNonzeros(A));
+   }
+   else
+   {
+      hypre_CSRMatrix *A_diag = hypre_ParCSRMatrixDiag(A);
+      double local_g_nnz = 0.5 * ((double) hypre_CSRMatrixNumNonzeros(A_diag) +
+                                  (double) hypre_CSRMatrixNumRows(A_diag));
+      double global_g_nnz = 0.0;
+      hypre_MPI_Allreduce(&local_g_nnz, &global_g_nnz, 1, hypre_MPI_DOUBLE,
+                          hypre_MPI_SUM, hypre_ParCSRMatrixComm(A));
+      hypre_ParCSRMatrixSetDNumNonzeros(A);
+      density = (hypre_ParCSRMatrixDNumNonzeros(A) > 0.0)
+                ? (HYPRE_Real)(global_g_nnz / hypre_ParCSRMatrixDNumNonzeros(A))
+                : 0.0;
+   }
    hypre_ParFSAIDataDensity(fsai_data) = density;
 
    if (!my_id)
@@ -1189,9 +1873,19 @@ hypre_FSAIComputeOmega( void               *fsai_vdata,
       }
 
       /* eigvec = GT * G * A * eigvec */
-      hypre_ParCSRMatrixMatvec(1.0, A,  eigvec, 0.0, r_work);
-      hypre_ParCSRMatrixMatvec(1.0, G,  r_work, 0.0, z_work);
-      hypre_ParCSRMatrixMatvec(1.0, GT, z_work, 0.0, eigvec);
+      hypre_ParCSRMatrixMatvec(1.0, A, eigvec, 0.0, r_work);
+      if (hypre_ParFSAIDataAlgoType(fsai_data) == 4)
+      {
+         HYPRE_Real saved_omega = hypre_ParFSAIDataOmega(fsai_data);
+         hypre_ParFSAIDataOmega(fsai_data) = 1.0;
+         hypre_FSAIApply(fsai_vdata, 0.0, r_work, eigvec);
+         hypre_ParFSAIDataOmega(fsai_data) = saved_omega;
+      }
+      else
+      {
+         hypre_ParCSRMatrixMatvec(1.0, G,  r_work, 0.0, z_work);
+         hypre_ParCSRMatrixMatvec(1.0, GT, z_work, 0.0, eigvec);
+      }
    }
    norm = hypre_ParVectorInnerProd(eigvec, eigvec_old);
    lambda = hypre_sqrt(norm);

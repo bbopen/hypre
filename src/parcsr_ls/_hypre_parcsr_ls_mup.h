@@ -4241,6 +4241,13 @@ HYPRE_Int
 hypre_FSAIDumpLocalLSDense_long_dbl( void *fsai_vdata, const char *filename, hypre_ParCSRMatrix *A );
 
 HYPRE_Int
+hypre_FSAIFreeBitFSAI_flt( void *data );
+HYPRE_Int
+hypre_FSAIFreeBitFSAI_dbl( void *data );
+HYPRE_Int
+hypre_FSAIFreeBitFSAI_long_dbl( void *data );
+
+HYPRE_Int
 hypre_FSAIGetAlgoType_flt( void *data, HYPRE_Int *algo_type );
 HYPRE_Int
 hypre_FSAIGetAlgoType_dbl( void *data, HYPRE_Int *algo_type );

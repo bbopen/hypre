@@ -1353,6 +1353,7 @@
 #undef hypre_FSAICreate
 #undef hypre_FSAIDestroy
 #undef hypre_FSAIDumpLocalLSDense
+#undef hypre_FSAIFreeBitFSAI
 #undef hypre_FSAIGetAlgoType
 #undef hypre_FSAIGetEigMaxIters
 #undef hypre_FSAIGetKapTolerance
@@ -2284,9 +2285,11 @@
 #undef hypre_BoomerAMGMakeSocFromSDevice
 #undef hypre_BoomerAMGRelaxHybridGaussSeidelDevice
 #undef hypre_BoomerAMGRelaxTwoStageGaussSeidelDevice
+#undef hypre_FSAIApplyBitFSAIDevice
 #undef hypre_FSAIExtractSubSystemsDevice
 #undef hypre_FSAIGatherEntriesDevice
 #undef hypre_FSAIScalingDevice
+#undef hypre_FSAISetupBitFSAIDevice
 #undef hypre_FSAISetupDevice
 #undef hypre_FSAISetupStaticPowerDevice
 #undef hypre_FSAITruncateCandidateDevice

@@ -203,6 +203,20 @@ HYPRE_Int
 hypre_BoomerAMGRelaxTwoStageGaussSeidelDevice_long_dbl( hypre_ParCSRMatrix *A, hypre_ParVector *f, hypre_long_double relax_weight, hypre_long_double omega, hypre_long_double *A_diag_diag, hypre_ParVector *u, hypre_ParVector *r, hypre_ParVector *z, HYPRE_Int choice );
 
 HYPRE_Int
+hypre_FSAIApplyBitFSAIDevice_flt( void *fsai_vdata, hypre_float alpha, hypre_ParVector *b, hypre_ParVector *x );
+HYPRE_Int
+hypre_FSAIApplyBitFSAIDevice_dbl( void *fsai_vdata, hypre_double alpha, hypre_ParVector *b, hypre_ParVector *x );
+HYPRE_Int
+hypre_FSAIApplyBitFSAIDevice_long_dbl( void *fsai_vdata, hypre_long_double alpha, hypre_ParVector *b, hypre_ParVector *x );
+
+HYPRE_Int
+hypre_FSAISetupBitFSAIDevice_flt( void *fsai_vdata, hypre_ParCSRMatrix *A );
+HYPRE_Int
+hypre_FSAISetupBitFSAIDevice_dbl( void *fsai_vdata, hypre_ParCSRMatrix *A );
+HYPRE_Int
+hypre_FSAISetupBitFSAIDevice_long_dbl( void *fsai_vdata, hypre_ParCSRMatrix *A );
+
+HYPRE_Int
 hypre_FSAISetupDevice_flt( void *fsai_vdata, hypre_ParCSRMatrix *A, hypre_ParVector *f, hypre_ParVector *u );
 HYPRE_Int
 hypre_FSAISetupDevice_dbl( void *fsai_vdata, hypre_ParCSRMatrix *A, hypre_ParVector *f, hypre_ParVector *u );

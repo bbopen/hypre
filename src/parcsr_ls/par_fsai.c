@@ -93,11 +93,21 @@ hypre_FSAICreate( void )
     * Create the hypre_ParFSAIData structure and return
     *-----------------------------------------------------------------------*/
 
-   hypre_ParFSAIDataGmat(fsai_data)      = NULL;
-   hypre_ParFSAIDataGTmat(fsai_data)     = NULL;
-   hypre_ParFSAIDataRWork(fsai_data)     = NULL;
-   hypre_ParFSAIDataZWork(fsai_data)     = NULL;
-   hypre_ParFSAIDataZeroGuess(fsai_data) = 0;
+   hypre_ParFSAIDataGmat(fsai_data)           = NULL;
+   hypre_ParFSAIDataGTmat(fsai_data)          = NULL;
+   hypre_ParFSAIDataBitFSAIADiag(fsai_data)     = NULL;
+   hypre_ParFSAIDataBitFSAINumRows(fsai_data)   = 0;
+   hypre_ParFSAIDataBitFSAINnz(fsai_data)       = 0;
+   hypre_ParFSAIDataBitFSAIWideApply(fsai_data) = 0;
+   hypre_ParFSAIDataBitFSAIMemLoc(fsai_data)    = HYPRE_MEMORY_HOST;
+   hypre_ParFSAIDataBitFSAIGDiag(fsai_data)     = NULL;
+   hypre_ParFSAIDataBitFSAIGScale(fsai_data)    = NULL;
+   hypre_ParFSAIDataBitFSAIQPacked(fsai_data)   = NULL;
+   hypre_ParFSAIDataBitFSAIYWork(fsai_data)     = NULL;
+   hypre_ParFSAIDataBitFSAITWork(fsai_data)     = NULL;
+   hypre_ParFSAIDataRWork(fsai_data)          = NULL;
+   hypre_ParFSAIDataZWork(fsai_data)          = NULL;
+   hypre_ParFSAIDataZeroGuess(fsai_data)      = 0;
 
    hypre_FSAISetAlgoType(fsai_data, algo_type);
    hypre_FSAISetLocalSolveType(fsai_data, local_solve_type);
@@ -122,6 +132,31 @@ hypre_FSAICreate( void )
    return (void *) fsai_data;
 }
 
+HYPRE_Int
+hypre_FSAIFreeBitFSAI( void *data )
+{
+   hypre_ParFSAIData *fsai_data = (hypre_ParFSAIData*) data;
+
+   if (fsai_data)
+   {
+      HYPRE_MemoryLocation memloc = hypre_ParFSAIDataBitFSAIMemLoc(fsai_data);
+
+      hypre_TFree(hypre_ParFSAIDataBitFSAIGDiag(fsai_data), memloc);
+      hypre_TFree(hypre_ParFSAIDataBitFSAIGScale(fsai_data), memloc);
+      hypre_TFree(hypre_ParFSAIDataBitFSAIQPacked(fsai_data), memloc);
+      hypre_TFree(hypre_ParFSAIDataBitFSAIYWork(fsai_data), memloc);
+      hypre_TFree(hypre_ParFSAIDataBitFSAITWork(fsai_data), memloc);
+
+      hypre_ParFSAIDataBitFSAIADiag(fsai_data)     = NULL;
+      hypre_ParFSAIDataBitFSAINumRows(fsai_data)   = 0;
+      hypre_ParFSAIDataBitFSAINnz(fsai_data)       = 0;
+      hypre_ParFSAIDataBitFSAIWideApply(fsai_data) = 0;
+      hypre_ParFSAIDataBitFSAIMemLoc(fsai_data)    = HYPRE_MEMORY_HOST;
+   }
+
+   return hypre_error_flag;
+}
+
 /******************************************************************************
  * HYPRE_FSAIDestroy
  ******************************************************************************/
@@ -144,6 +179,8 @@ hypre_FSAIDestroy( void *data )
       {
          hypre_ParCSRMatrixDestroy(hypre_ParFSAIDataGTmat(fsai_data));
       }
+
+      hypre_FSAIFreeBitFSAI(fsai_data);
 
       hypre_ParVectorDestroy(hypre_ParFSAIDataRWork(fsai_data));
       hypre_ParVectorDestroy(hypre_ParFSAIDataZWork(fsai_data));
